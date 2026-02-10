@@ -1,55 +1,105 @@
-name: Build DLP
-
+name: Tab A9+ Custom Kernel (Bit 6 - qgki)
 
 on:
   workflow_dispatch:
 
-
 jobs:
-  build-kernel:
-      - name: Setup environment
-        run: |
-          echo "ANYKERNEL_SOURCE=$(grep ANYKERNEL_SOURCE config.env | cut -d '=' -f 2)" >> $GITHUB_ENV
-          echo "ANYKERNEL_SOURCE_BRANCH=$(grep ANYKERNEL_SOURCE_BRANCH config.env | cut -d '=' -f 2)" >> $GITHUB_ENV
-          echo "KERNEL_SOURCE=$(grep KERNEL_SOURCE config.env | cut -d '=' -f 2 | head -n 1)" >> $GITHUB_ENV
-          echo "KERNEL_SOURCE_BRANCH=$(grep KERNEL_SOURCE_BRANCH config.env | cut -d '=' -f 2)" >> $GITHUB_ENV
-          echo "KERNEL_CONFIG=$(grep KERNEL_CONFIG config.env | cut -d '=' -f 2)" >> $GITHUB_ENV
-          echo "BUILD_ARGS=$(grep BUILD_ARGS config.env | cut -d '=' -f 2)" >> $GITHUB_ENV
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
 
-      - name: Pull toolchain
+      - name: 🛠️ Install Build Tools
         run: |
-          mkdir clang
-          curl -L https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r450784d.tar.gz | tar -xzC clang
-          git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9 gcc64
-          git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9 gcc32
+          sudo apt-get update
+          sudo apt-get install -y bc build-essential zip curl libstdc++6 git wget 7zip python3 libssl-dev libelf-dev llvm lld
+          
+          # Setup Toolchains (Standard for 5.4.249 kernels)
+          mkdir toolchains
+          git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9 toolchains/gcc64
+          git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9 toolchains/gcc32
+          git clone --depth=1 https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b toolchains/clang
 
-
-            - name: Build kernel
+      - name: 📦 Reconstruct and Unpack Source
         run: |
-          export PATH=$PWD/clang/bin:$PWD/gcc64/bin:$PWD/gcc32/bin:$PATH
+          echo "🔗 Recombining parts from Kernel_Source folder..."
+          
+          # Stitches together kern.zip.aa, kern.zip.ab, etc.
+          cat Kernel_Source/kern.zip.* > Combined_Source.zip
+          
+          mkdir -p kernel-source
+          echo "📂 Extracting Zip..."
+          7z x Combined_Source.zip -okernel-source/
+          
           cd kernel-source
-          make -j$(nproc --all) O=out ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android- CROSS_COMPILE_ARM32=arm-linux-androideabi- ${{ env.KERNEL_CONFIG }}
-          make -j$(nproc --all) O=out ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android- CROSS_COMPILE_ARM32=arm-linux-androideabi- ${{ env.BUILD_ARGS }}
+          # Extract Samsung's inner tarball if it's there
+          if [ -f "Kernel.tar.gz" ]; then
+            tar -xf Kernel.tar.gz --strip-components=1
+          fi
+          
+          # 🚨 CRITICAL CHECK: Verify we have the A9+ config
+          if [ -f "arch/arm64/configs/vendor/gta9pwifi_eur_open_defconfig" ]; then
+             echo "✅ SUCCESS: Tab A9+ (qgki) source verified!"
+          else
+             echo "❌ ERROR: Defconfig not found. Check your folder names on GitHub."
+             ls -R arch/arm64/configs/vendor/ || echo "Folder missing!"
+             exit 1
+          fi
 
-
-      - name: Package kernel
+      - name: 🛠️ Patch KernelSU (Root)
         run: |
-          git clone --depth=1 ${{ env.ANYKERNEL_SOURCE }} -b ${{ env.ANYKERNEL_SOURCE_BRANCH }} AnyKernel3 && rm -rf AnyKernel3/.git AnyKernel3/.github AnyKernel3/LICENSE AnyKernel3/README.md
-          if [[ -f out/arch/arm64/boot/Image.gz-dtb ]]; then
-            cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/Image.gz-dtb
-          elif [[ -f out/arch/arm64/boot/Image-dtb ]]; then
-            cp out/arch/arm64/boot/Image-dtb AnyKernel3/Image-dtb
-          elif [[ -f out/arch/arm64/boot/Image.gz ]]; then
-            cp out/arch/arm64/boot/Image.gz AnyKernel3/Image.gz
-          elif [[ -f out/arch/arm64/boot/Image ]]; then
-            cp out/arch/arm64/boot/Image AnyKernel3/Image
-          fi
-          if [ -f out/arch/arm64/boot/dtbo.img ]; then
-            cp out/arch/arm64/boot/dtbo.img AnyKernel3/dtbo.img
-          fi
+          cd kernel-source
+          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
+          
+          # Configure KSU in the defconfig
+          CONFIG="arch/arm64/configs/vendor/gta9pwifi_eur_open_defconfig"
+          echo "CONFIG_KSU=y" >> $CONFIG
+          echo "CONFIG_OVERLAY_FS=y" >> $CONFIG
+          # Match your tablet's Permissive status
+          sed -i 's/CONFIG_ALWAYS_ENFORCE=y/CONFIG_ALWAYS_ENFORCE=n/g' $CONFIG
 
-      - name: Upload kernel to artifact
+      - name: ⚙️ Configure and Compile
+        run: |
+          TOOLCHAIN_DIR=$GITHUB_WORKSPACE/toolchains
+          CLANG_BIN=$TOOLCHAIN_DIR/clang/bin
+          
+          cd $GITHUB_WORKSPACE/kernel-source
+          
+          # Force ARCH=arm64 to prevent the MIPS error
+          MAKE_ARGS="
+            ARCH=arm64 \
+            SUBARCH=arm64 \
+            O=out \
+            CC=$CLANG_BIN/clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=$TOOLCHAIN_DIR/gcc64/bin/aarch64-linux-android- \
+            CROSS_COMPILE_ARM32=$TOOLCHAIN_DIR/gcc32/bin/arm-linux-androideabi- \
+            LD=$CLANG_BIN/ld.lld \
+            AR=$CLANG_BIN/llvm-ar \
+            NM=$CLANG_BIN/llvm-nm \
+            OBJCOPY=$CLANG_BIN/llvm-objcopy \
+            OBJDUMP=$CLANG_BIN/llvm-objdump \
+            STRIP=$CLANG_BIN/llvm-strip \
+            DTC_EXT=dtc \
+            KCFLAGS=-Wno-error
+          "
+
+          echo "⚙️ Running Defconfig..."
+          make $MAKE_ARGS vendor/gta9pwifi_eur_open_defconfig
+
+          echo "🚀 Building Kernel (thousands of CC lines)..."
+          make -j$(nproc --all) $MAKE_ARGS Image.gz-dtb 2>&1 | tee ../build.log
+
+          # Find the output
+          mkdir -p $GITHUB_WORKSPACE/final_output
+          find out/arch/arm64/boot -name "Image.gz-dtb" -exec cp {} $GITHUB_WORKSPACE/final_output/ \;
+
+      - name: 📤 Upload Result
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: output_kernel
-          path: AnyKernel3/*
+          name: Tab-A9-Plus-Kernel-KSU
+          path: |
+            final_output/Image.gz-dtb
+            build.log
