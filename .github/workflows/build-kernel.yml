@@ -103,17 +103,29 @@ jobs:
             KCFLAGS=-Wno-error
           "
 
+          echo "⚙️ Running Defconfig..."
           make $MAKE_ARGS vendor/gta9pwifi_eur_open_defconfig
-          make -j$(nproc --all) $MAKE_ARGS Image.gz-dtb 2>&1 | tee ../build.log
 
+          echo "🚀 Building Kernel..."
+          # Build multiple targets to be safe
+          make -j$(nproc --all) $MAKE_ARGS Image.gz Image.gz-dtb 2>&1 | tee ../build.log
+
+          # 🔍 SEARCH AND RESCUE
+          echo "🔍 Searching for the compiled kernel..."
           mkdir -p $GITHUB_WORKSPACE/final_output
-          find out/arch/arm64/boot -name "Image.gz-dtb" -exec cp {} $GITHUB_WORKSPACE/final_output/ \;
+          
+          # This finds any kernel image and copies it to the output folder
+          find out/arch/arm64/boot -name "Image.gz*" -exec cp {} $GITHUB_WORKSPACE/final_output/ \;
+          
+          # List files found to verify in the GitHub Log
+          echo "✅ Files ready for upload:"
+          ls -lh $GITHUB_WORKSPACE/final_output/
 
       - name: 📤 Upload
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Tab-A9-Plus-Kernel-KSU
+          name: Tab-A9-Plus-Kernel-Result
           path: |
-            final_output/Image.gz-dtb
+            final_output/*
             build.log
