@@ -13,7 +13,7 @@ jobs:
       - name: 🛠️ Install Build Tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc build-essential zip curl libstdc++6 git wget 7zip python3 libssl-dev libelf-dev llvm lld
+          sudo apt-get install -y bc build-essential zip curl libstdc++6 git wget 7zip python3 libssl-dev libelf-dev llvm lld tree
           mkdir toolchains
           git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9 toolchains/gcc64
           git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9 toolchains/gcc32
@@ -26,48 +26,73 @@ jobs:
           mkdir -p kernel-source
           7z x Combined_Source.zip -okernel-source/
           cd kernel-source
+
           if [ -f "Kernels.zip" ]; then
             echo "📦 Unpacking inner archive..."
             7z x "Kernels.zip" -aoa && rm "Kernels.zip"
           fi
+
           INNER_TARBALL=$(find . -name "Kernel.tar.gz" | head -n 1)
           if [ -n "$INNER_TARBALL" ]; then
             echo "📦 Extracting tarball..."
             tar -xf "$INNER_TARBALL" --strip-components=1 && rm "$INNER_TARBALL"
           fi
+
+          # If Makefile not at root, find and promote the real kernel source
           if [ ! -f Makefile ]; then
-            echo "🔍 Finding kernel source..."
-            SUBDIR=$(find . -maxdepth 2 -name "Makefile" -exec dirname {} \;)
-            [ -n "$SUBDIR" ] && mv "$SUBDIR"/* .
+            echo "🔍 Makefile not at root, searching..."
+            SUBDIR=$(find . -maxdepth 3 -name "Makefile" -exec dirname {} \; | head -n 1)
+            if [ -n "$SUBDIR" ] && [ "$SUBDIR" != "." ]; then
+              echo "📁 Promoting source from: $SUBDIR"
+              mv "$SUBDIR"/* . 2>/dev/null || true
+              mv "$SUBDIR"/.* . 2>/dev/null || true
+            fi
           fi
-          echo "✅ Source unpacked successfully"
 
-      - name: 🛠️ Patch KernelSU-Next with Enhanced Error Handling
+          echo "✅ Unpack done"
+
+      - name: 🔍 Diagnose Source Layout
         run: |
-          cd kernel-source
-          set -e
+          echo "======= WORKSPACE ROOT ======="
+          ls -la $GITHUB_WORKSPACE/kernel-source/ | head -30
+          echo ""
+          echo "======= CHECKING KEY PATHS ======="
+          [ -f "$GITHUB_WORKSPACE/kernel-source/Makefile" ]       && echo "✅ Makefile found"     || echo "❌ Makefile MISSING"
+          [ -f "$GITHUB_WORKSPACE/kernel-source/fs/open.c" ]      && echo "✅ fs/open.c found"    || echo "❌ fs/open.c MISSING"
+          [ -f "$GITHUB_WORKSPACE/kernel-source/fs/exec.c" ]      && echo "✅ fs/exec.c found"    || echo "❌ fs/exec.c MISSING"
+          [ -d "$GITHUB_WORKSPACE/kernel-source/drivers" ]        && echo "✅ drivers/ found"     || echo "❌ drivers/ MISSING"
+          [ -d "$GITHUB_WORKSPACE/kernel-source/arch/arm64" ]     && echo "✅ arch/arm64 found"   || echo "❌ arch/arm64 MISSING"
+          echo ""
+          echo "======= DEFCONFIG SEARCH ======="
+          find $GITHUB_WORKSPACE/kernel-source -name "*defconfig*" 2>/dev/null | grep -i "gta9\|vendor" | head -10 || echo "No matching defconfigs found"
+          echo ""
+          echo "======= TOP-LEVEL DIRS ======="
+          ls -d $GITHUB_WORKSPACE/kernel-source/*/ 2>/dev/null | head -20
 
-          echo "🚀 Starting KernelSU-Next integration..."
+      - name: 🛠️ Patch KernelSU-Next
+        run: |
+          cd $GITHUB_WORKSPACE/kernel-source
 
-          # ── 1. Download & run setup ────────────────────────────────────────
-          echo "📥 Downloading and setting up KernelSU-Next..."
-          if ! curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" -o ksu_setup.sh; then
-            echo "❌ Failed to download KernelSU-Next setup script"
+          # ── Validate kernel source root ────────────────────────────────────
+          if [ ! -f "Makefile" ]; then
+            echo "❌ FATAL: Makefile not found. Unpack likely failed — check Diagnose step."
             exit 1
           fi
-          if ! bash ksu_setup.sh next; then
-            echo "❌ Failed to execute KernelSU-Next setup"
+          if [ ! -f "fs/open.c" ] || [ ! -f "fs/exec.c" ]; then
+            echo "❌ FATAL: fs/open.c or fs/exec.c missing."
             exit 1
           fi
-          rm ksu_setup.sh
+          echo "✅ Source root validated"
+
+          # ── 1. Run KSU-Next setup ──────────────────────────────────────────
+          echo "📥 Downloading KernelSU-Next setup..."
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" -o ksu_setup.sh
+          bash ksu_setup.sh next
+          rm -f ksu_setup.sh
           echo "✅ KernelSU-Next source integrated"
 
-          # ── 2. ✅ FIX: Hook KSU-Next into drivers/Makefile ─────────────────
-          # This is the root cause of the linker error. setup.sh places KSU
-          # source in drivers/kernelsu/ but does NOT add it to drivers/Makefile,
-          # so the symbols are never compiled — causing the undefined symbol error.
-          echo "🔗 Hooking KSU-Next into kernel build system..."
-
+          # ── 2. Hook KSU into drivers/Makefile (THE LINKER FIX) ────────────
+          echo "🔗 Hooking KSU-Next into build system..."
           KSU_DIR=""
           for candidate in "drivers/kernelsu" "KernelSU/kernel" "kernelsu"; do
             if [ -d "$candidate" ]; then
@@ -77,79 +102,80 @@ jobs:
           done
 
           if [ -z "$KSU_DIR" ]; then
-            echo "❌ Could not find KernelSU-Next source directory after setup"
-            find . -maxdepth 3 -name "*.c" | grep -i ksu | head -10
+            echo "❌ FATAL: KSU source directory not found after setup. Listing root:"
+            ls -la
             exit 1
           fi
-          echo "📁 Found KSU source at: $KSU_DIR"
+          echo "📁 KSU source at: $KSU_DIR"
 
-          # Ensure drivers/kernelsu/Makefile exists and has obj-y entries
-          if [ -f "$KSU_DIR/Makefile" ]; then
-            echo "✅ KSU Makefile exists:"
-            cat "$KSU_DIR/Makefile"
-          else
-            echo "⚠️  No Makefile in KSU dir — creating one from source files"
-            OBJS=$(ls "$KSU_DIR"/*.c 2>/dev/null | xargs -I{} basename {} .c | awk '{print "obj-y += "$1".o"}')
-            echo "$OBJS" > "$KSU_DIR/Makefile"
-            cat "$KSU_DIR/Makefile"
+          # Create Makefile in KSU dir if missing
+          if [ ! -f "$KSU_DIR/Makefile" ]; then
+            echo "⚠️ Auto-generating $KSU_DIR/Makefile from .c files"
+            for f in "$KSU_DIR"/*.c; do
+              base=$(basename "$f" .c)
+              echo "obj-y += ${base}.o"
+            done > "$KSU_DIR/Makefile"
           fi
+          echo "--- $KSU_DIR/Makefile ---"
+          cat "$KSU_DIR/Makefile"
 
-          # Add KSU directory to drivers/Makefile (the key fix)
+          # Register KSU dir in drivers/Makefile
           REL_PATH=$(realpath --relative-to=drivers "$KSU_DIR")
           if ! grep -q "$REL_PATH" drivers/Makefile; then
-            echo "obj-y += $REL_PATH/" >> drivers/Makefile
-            echo "✅ Added 'obj-y += $REL_PATH/' to drivers/Makefile"
+            echo "obj-y += ${REL_PATH}/" >> drivers/Makefile
+            echo "✅ Added 'obj-y += ${REL_PATH}/' to drivers/Makefile"
           else
-            echo "ℹ️  drivers/Makefile already references $REL_PATH"
+            echo "ℹ️ drivers/Makefile already has $REL_PATH"
           fi
+          echo "--- drivers/Makefile (last 5 lines) ---"
+          tail -5 drivers/Makefile
 
-          # ── 3. Verify required source files ────────────────────────────────
-          [ ! -f "fs/open.c" ] && echo "❌ fs/open.c not found" && exit 1
-          [ ! -f "fs/exec.c" ] && echo "❌ fs/exec.c not found" && exit 1
-
-          # ── 4. Add extern declarations ─────────────────────────────────────
+          # ── 3. Back up + extern declarations ──────────────────────────────
           echo "📝 Adding extern declarations..."
           cp fs/open.c fs/open.c.backup
           cp fs/exec.c fs/exec.c.backup
 
           if ! grep -q "ksu_handle_faccessat" fs/open.c; then
             sed -i '1i extern int ksu_handle_faccessat(int *dfd, const char __user **filename, int *mode, int *flags);' fs/open.c
+            echo "✅ faccessat extern added"
           fi
 
           if ! grep -q "ksu_handle_execveat" fs/exec.c; then
             sed -i '1i struct user_arg_ptr;\nextern int ksu_handle_execveat(int *fd, struct filename **filename, struct user_arg_ptr *argv, struct user_arg_ptr *envp, int *flags);' fs/exec.c
+            echo "✅ execveat extern added"
           fi
-          echo "✅ Extern declarations added"
 
-          # ── 5. Inject hooks ────────────────────────────────────────────────
-          echo "🪝 Injecting KSU hooks..."
+          # ── 4. Inject call sites ───────────────────────────────────────────
+          echo "🪝 Injecting KSU hook calls..."
 
           if grep -q "long do_faccessat(int dfd, const char __user \*filename, int mode" fs/open.c; then
-            sed -i '/long do_faccessat(int dfd, const char __user \*filename, int mode)/{n;s/{/{ ksu_handle_faccessat(\&dfd, \&filename, \&mode, NULL);/}' fs/open.c
-            echo "✅ faccessat hook injected"
+            if ! grep -q "ksu_handle_faccessat(&" fs/open.c; then
+              sed -i '/long do_faccessat(int dfd, const char __user \*filename, int mode)/{n;s/{/{ ksu_handle_faccessat(\&dfd, \&filename, \&mode, NULL);/}' fs/open.c
+              echo "✅ faccessat hook call injected"
+            fi
           else
-            echo "⚠️  do_faccessat pattern not matched; checking alternatives..."
+            echo "⚠️ do_faccessat signature not matched — nearby:"
             grep -n "do_faccessat" fs/open.c | head -5
           fi
 
           if grep -q "int do_execveat_common(int fd, struct filename \*filename," fs/exec.c; then
-            sed -i '/int do_execveat_common(int fd, struct filename \*filename,/{n;s/{/{ ksu_handle_execveat(\&fd, \&filename, \&argv, \&envp, \&flags);/}' fs/exec.c
-            echo "✅ execveat hook injected"
+            if ! grep -q "ksu_handle_execveat(&" fs/exec.c; then
+              sed -i '/int do_execveat_common(int fd, struct filename \*filename,/{n;s/{/{ ksu_handle_execveat(\&fd, \&filename, \&argv, \&envp, \&flags);/}' fs/exec.c
+              echo "✅ execveat hook call injected"
+            fi
           else
-            echo "⚠️  do_execveat_common pattern not matched; checking alternatives..."
+            echo "⚠️ do_execveat_common signature not matched — nearby:"
             grep -n "do_execveat_common\|do_execve" fs/exec.c | head -5
           fi
 
-          # ── 6. Configure defconfig ─────────────────────────────────────────
-          echo "⚙️ Configuring kernel..."
+          # ── 5. Configure defconfig ─────────────────────────────────────────
           CONFIG_PATH=$(find . -path "*/arch/arm64/configs/vendor/gta9pwifi_eur_open_defconfig" | head -n 1)
-
           if [ -z "$CONFIG_PATH" ]; then
-            echo "❌ Defconfig not found"
-            find . -name "*gta9pwifi*" -o -name "*defconfig" | grep -E "gta9pwifi|vendor" | head -10
+            echo "❌ FATAL: gta9pwifi defconfig not found. Available:"
+            find . -name "*defconfig" | head -20
             exit 1
           fi
-          echo "📋 Using defconfig: $CONFIG_PATH"
+          echo "📋 Defconfig: $CONFIG_PATH"
 
           sed -i '/CONFIG_KSU/d' "$CONFIG_PATH"
           {
@@ -159,17 +185,7 @@ jobs:
             echo "CONFIG_OVERLAY_FS=y"
           } >> "$CONFIG_PATH"
           sed -i 's/CONFIG_KPROBES=y/CONFIG_KPROBES=n/g' "$CONFIG_PATH"
-          echo "✅ Kernel configuration updated"
-
-          # ── 7. Final verification ──────────────────────────────────────────
-          echo "🔍 Verifying build integration..."
-          echo "--- drivers/Makefile (last 5 lines) ---"
-          tail -5 drivers/Makefile
-          echo "--- KSU symbols in fs/open.c ---"
-          grep "ksu_handle_faccessat" fs/open.c || echo "⚠️ Not found"
-          echo "--- KSU symbols in fs/exec.c ---"
-          grep "ksu_handle_execveat" fs/exec.c || echo "⚠️ Not found"
-          echo "✅ KernelSU-Next integration completed"
+          echo "✅ Defconfig updated. Patching complete."
 
       - name: ⚙️ Configure and Compile
         run: |
@@ -177,8 +193,6 @@ jobs:
           TOOLCHAIN_DIR=$GITHUB_WORKSPACE/toolchains
           CLANG_BIN=$TOOLCHAIN_DIR/clang/bin
           cd $GITHUB_WORKSPACE/kernel-source
-
-          echo "🔧 Setting up build environment..."
 
           MAKE_ARGS="
             ARCH=arm64 \
@@ -198,48 +212,45 @@ jobs:
             KCFLAGS=-Wno-error
           "
 
-          echo "⚙️ Configuring kernel..."
+          echo "⚙️ Running defconfig..."
           make $MAKE_ARGS vendor/gta9pwifi_eur_open_defconfig
 
-          echo "🔨 Starting compilation..."
-          make -j$(nproc --all) $MAKE_ARGS Image.gz dtbs 2>&1 | tee ../build.log
+          echo "🔨 Compiling..."
+          make -j$(nproc --all) $MAKE_ARGS Image.gz dtbs 2>&1 | tee $GITHUB_WORKSPACE/build.log
 
-          echo "📦 Preparing artifacts..."
           mkdir -p $GITHUB_WORKSPACE/final_output
-
           if [ -f "out/arch/arm64/boot/Image.gz" ]; then
-            echo "✅ Kernel image built successfully"
+            echo "✅ Image.gz found"
             DTBS=$(find out/arch/arm64/boot/dts -name "*.dtb" 2>/dev/null | head -10)
             if [ -n "$DTBS" ]; then
-              echo "🔗 Combining kernel with DTBs..."
               cat out/arch/arm64/boot/Image.gz $DTBS > out/arch/arm64/boot/Image.gz-dtb
               cp out/arch/arm64/boot/Image.gz-dtb $GITHUB_WORKSPACE/final_output/
             fi
             cp out/arch/arm64/boot/Image.gz $GITHUB_WORKSPACE/final_output/
             find out/arch/arm64/boot/dts -name "*.dtb" -exec cp {} $GITHUB_WORKSPACE/final_output/ \;
           else
-            echo "❌ Kernel image not found"
+            echo "❌ Image.gz not found"
             exit 1
           fi
 
-          echo "✅ Build completed successfully"
-
       - name: 📤 Upload Artifacts
-        if: always()
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: Kernels-Result-${{ github.run_id }}
+          name: Kernel-Result-${{ github.run_id }}
           path: |
-            final_output/*
-            build.log
+            ${{ github.workspace }}/final_output/
+            ${{ github.workspace }}/build.log
           retention-days: 30
 
-      - name: 📊 Upload Backup Files (if failed)
+      - name: 📊 Upload Debug Info (on failure)
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: KernelSU-Debug-Info-${{ github.run_id }}
           path: |
-            kernel-source/fs/open.c.backup
-            kernel-source/fs/exec.c.backup
+            ${{ github.workspace }}/build.log
+            ${{ github.workspace }}/kernel-source/fs/open.c.backup
+            ${{ github.workspace }}/kernel-source/fs/exec.c.backup
+          if-no-files-found: warn
           retention-days: 7
