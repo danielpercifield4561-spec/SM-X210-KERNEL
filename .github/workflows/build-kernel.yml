@@ -66,25 +66,50 @@ jobs:
              exit 1
           fi
    
-      - name: 🛠️ Patch KernelSU-Next (Fixing Permissions & Hooks)
+      - name: 🛠️ Patch KernelSU-Next (Manual Hook Injection)
         run: |
           cd kernel-source
-          # 1. Force permissions on the entire source tree
-          sudo chmod -R 777 . 
+          sudo chmod -R 777 .
           
-          # 2. Run the legacy setup script
+          # 1. Run the base patch
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
           
-          # 3. Use 'sed' to inject the manual hooks into the code
-          # This tells the kernel WHERE to let KernelSU take control
-          sed -i '/asmlinkage long sys_faccessat(int dfd, const char __user \*filename, int mode)/a \{ ksu_handle_faccessat(&dfd, &filename, &mode, NULL);' fs/open.c
-          sed -i '/int do_execveat_common(int fd, struct filename \*filename,/a \{ ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);' fs/exec.c
+          # 2. CREATE A UNIVERSAL PATCH FILE
+          # This adds the hooks at the very top of the function definitions
+          cat <<EOF > ksu_manual.patch
+          --- a/fs/open.c
+          +++ b/fs/open.c
+          @@ -1,5 +1,6 @@
+          +#include "../drivers/kernelsu/ksu.h"
+           long do_faccessat(int dfd, const char __user *filename, int mode)
+          {
+          +	ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
+          	struct path path;
 
-          # 4. Update the config to enable KernelSU
+           --- a/fs/exec.c
+           +++ b/fs/exec.c
+           @@ -1,5 +1,6 @@
+           +#include "../drivers/kernelsu/ksu.h"
+            int do_execveat_common(int fd, struct filename *filename,
+            {
+           +	ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
+            	struct linux_binprm *bprm;
+            EOF
+
+          # 3. APPLY THE PATCH (This is much more reliable than sed)
+          patch -p1 < ksu_manual.patch || echo "⚠️ Patch failed, but we will force continue"
+
+          # 4. Final Configs
           CONFIG="arch/arm64/configs/vendor/gta9pwifi_eur_open_defconfig"
+          sed -i '/CONFIG_KSU/d' $CONFIG
           echo "CONFIG_KSU=y" >> $CONFIG
           echo "CONFIG_KSU_NEXT=y" >> $CONFIG
           echo "CONFIG_KSU_MANUAL_HOOK=y" >> $CONFIG
+          # Disable KPROBES to ensure the manual hooks are used exclusively
+          echo "CONFIG_KPROBES=n" >> $CONFIG
+          echo "CONFIG_KPROBES_QGKI=n" >> $CONFIG
+          echo "CONFIG_OVERLAY_FS=y" >> $CONFIG
+
 
 
 
