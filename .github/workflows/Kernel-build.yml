@@ -54,118 +54,41 @@ jobs:
         run: |
           cd $GITHUB_WORKSPACE/kernel-source
 
-          if [ ! -f "Makefile" ] || [ ! -f "fs/open.c" ] || [ ! -f "fs/exec.c" ]; then
-            echo "❌ FATAL: Kernel source root is incomplete. Contents:"
-            ls -la
-            exit 1
-          fi
-          echo "✅ Source root validated"
-
-          # ── FIX 1: Make drivers/Makefile writable BEFORE setup.sh runs ────
-          echo "🔓 Unlocking drivers/Makefile permissions..."
-          chmod u+w drivers/Makefile
-          chmod u+w drivers/ 2>/dev/null || true
-          echo "✅ drivers/Makefile is now writable"
-
-          # ── 1. Run KSU-Next setup ──────────────────────────────────────────
-          echo "📥 Downloading KernelSU-Next setup..."
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" -o ksu_setup.sh
-          # setup.sh will now successfully write to drivers/Makefile itself
-          bash ksu_setup.sh next || bash ksu_setup.sh || true
-          rm -f ksu_setup.sh
-          echo "✅ KernelSU-Next source integrated"
-
-          # ── 2. Locate KSU source dir ───────────────────────────────────────
-          KSU_DIR=""
-          for candidate in "drivers/kernelsu" "KernelSU/kernel" "kernelsu"; do
-            if [ -d "$candidate" ]; then
-              KSU_DIR="$candidate"
-              break
-            fi
-          done
-          if [ -z "$KSU_DIR" ]; then
-            echo "❌ FATAL: KSU source dir not found. Listing:"
-            ls -la
-            exit 1
-          fi
-          echo "📁 KSU source at: $KSU_DIR"
-
-          # ── FIX 2: Replace standalone Makefile with kernel obj-y style ─────
-          # The repo ships a standalone Makefile (for out-of-tree builds).
-          # For in-tree builds the kernel needs: obj-y += file.o
-          echo "📝 Writing kernel-compatible obj-y Makefile for $KSU_DIR..."
-          OBJS=""
-          for f in "$KSU_DIR"/*.c; do
-            [ -f "$f" ] || continue
-            base=$(basename "$f" .c)
-            OBJS="${OBJS}obj-y += ${base}.o\n"
-          done
-          if [ -z "$OBJS" ]; then
-            echo "❌ FATAL: No .c files found in $KSU_DIR"
-            ls "$KSU_DIR"
-            exit 1
-          fi
-          printf "%b\n" "$OBJS" > "$KSU_DIR/Makefile"
-          echo "--- New $KSU_DIR/Makefile ---"
-          cat "$KSU_DIR/Makefile"
-
-          # ── 3. Ensure drivers/Makefile has KSU entry ──────────────────────
-          # setup.sh should have added this, but if it failed due to permissions
-          # (before our chmod), add it manually now.
-          REL_PATH=$(realpath --relative-to=drivers "$KSU_DIR")
-          if ! grep -q "$REL_PATH" drivers/Makefile; then
-            echo "obj-y += ${REL_PATH}/" >> drivers/Makefile
-            echo "✅ Manually added 'obj-y += ${REL_PATH}/' to drivers/Makefile"
-          else
-            echo "ℹ️ drivers/Makefile already has entry for $REL_PATH"
-          fi
-          echo "--- drivers/Makefile (last 5 lines) ---"
-          tail -5 drivers/Makefile
-
-          # ── 4. Back up fs files + add extern declarations ──────────────────
-          cp fs/open.c fs/open.c.backup
-          cp fs/exec.c fs/exec.c.backup
-
-          if ! grep -q "ksu_handle_faccessat" fs/open.c; then
-            sed -i '1i extern int ksu_handle_faccessat(int *dfd, const char __user **filename, int *mode, int *flags);' fs/open.c
-            echo "✅ faccessat extern added"
+          # 1. Unlock permissions
+          chmod -R u+w drivers/
+          
+          # 2. Integrate KernelSU-Next Source
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next
+          
+          # 3. FIX THE KSU MAKEFILE (The "Undefined Symbol" Fix)
+          # We need to ensure the KSU objects are added to the kernel's build list correctly
+          KSU_DIR="drivers/kernelsu"
+          if [ -d "$KSU_DIR" ]; then
+            echo "📝 Creating proper Kbuild for KSU..."
+            cat <<EOF > $KSU_DIR/Makefile
+          obj-y += ksu.o
+          obj-y += allowlist.o
+          obj-y += auto_n_root.o
+          obj-y += engine.o
+          obj-y += manager.o
+          obj-y += overlayfs.o
+          obj-y += stat.o
+          obj-y += su.o
+          obj-y += hooks.o
+          EOF
           fi
 
-          if ! grep -q "ksu_handle_execveat" fs/exec.c; then
-            sed -i '1i struct user_arg_ptr;\nextern int ksu_handle_execveat(int *fd, struct filename **filename, struct user_arg_ptr *argv, struct user_arg_ptr *envp, int *flags);' fs/exec.c
-            echo "✅ execveat extern added"
-          fi
+          # 4. Inject Externs and Hooks (Manual Injection)
+          # Adding externs to top of files
+          sed -i '1i extern int ksu_handle_faccessat(int *dfd, const char __user **filename, int *mode, int *flags);' fs/open.c
+          sed -i '1i struct user_arg_ptr;\nextern int ksu_handle_execveat(int *fd, struct filename **filename, struct user_arg_ptr *argv, struct user_arg_ptr *envp, int *flags);' fs/exec.c
 
-          # ── 5. Inject hook call sites ──────────────────────────────────────
-          if grep -q "long do_faccessat(int dfd, const char __user \*filename, int mode" fs/open.c; then
-            if ! grep -q "ksu_handle_faccessat(&" fs/open.c; then
-              sed -i '/long do_faccessat(int dfd, const char __user \*filename, int mode)/{n;s/{/{ ksu_handle_faccessat(\&dfd, \&filename, \&mode, NULL);/}' fs/open.c
-              echo "✅ faccessat hook call injected"
-            fi
-          else
-            echo "⚠️ do_faccessat signature not matched:"
-            grep -n "do_faccessat" fs/open.c | head -5
-          fi
+          # Injecting the calls into the functions
+          sed -i '/long do_faccessat(int dfd, const char __user \*filename, int mode)/{n;s/{/{ ksu_handle_faccessat(\&dfd, \&filename, \&mode, NULL);/}' fs/open.c
+          sed -i '/int do_execveat_common(int fd, struct filename \*filename,/{n;s/{/{ ksu_handle_execveat(\&fd, \&filename, \&argv, \&envp, \&flags);/}' fs/exec.c
 
-          if grep -q "int do_execveat_common(int fd, struct filename \*filename," fs/exec.c; then
-            if ! grep -q "ksu_handle_execveat(&" fs/exec.c; then
-              sed -i '/int do_execveat_common(int fd, struct filename \*filename,/{n;s/{/{ ksu_handle_execveat(\&fd, \&filename, \&argv, \&envp, \&flags);/}' fs/exec.c
-              echo "✅ execveat hook call injected"
-            fi
-          else
-            echo "⚠️ do_execveat_common signature not matched:"
-            grep -n "do_execveat_common\|do_execve" fs/exec.c | head -5
-          fi
-
-          # ── 6. Configure defconfig ─────────────────────────────────────────
-          CONFIG_PATH=$(find . -path "*/arch/arm64/configs/vendor/gta9pwifi_eur_open_defconfig" | head -n 1)
-          if [ -z "$CONFIG_PATH" ]; then
-            echo "❌ FATAL: gta9pwifi defconfig not found. Available:"
-            find . -name "*defconfig" | head -20
-            exit 1
-          fi
-          echo "📋 Defconfig: $CONFIG_PATH"
-
+          # 5. Configure Defconfig
+          CONFIG_PATH="arch/arm64/configs/vendor/gta9pwifi_eur_open_defconfig"
           sed -i '/CONFIG_KSU/d' "$CONFIG_PATH"
           {
             echo "CONFIG_KSU=y"
@@ -173,9 +96,10 @@ jobs:
             echo "CONFIG_KSU_MANUAL_HOOK=y"
             echo "CONFIG_OVERLAY_FS=y"
           } >> "$CONFIG_PATH"
+          # Disable Kprobes to avoid conflict with manual hooks
           sed -i 's/CONFIG_KPROBES=y/CONFIG_KPROBES=n/g' "$CONFIG_PATH"
 
-          echo "✅ Patching complete"
+
 
       - name: ⚙️ Configure and Compile
         run: |
