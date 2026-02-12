@@ -1,4 +1,4 @@
-name: Tab A9+ KSU-Next (Final Fix)
+name: Tab A9+ KSU-Next (Top-Level Integration)
 
 on:
   workflow_dispatch:
@@ -33,33 +33,34 @@ jobs:
             [ -n "$SUBDIR" ] && mv "$SUBDIR"/* .
           fi
 
-      - name: 🛠️ Patch KernelSU-Next
+      - name: 🛠️ Patch KernelSU-Next (Top-Level Method)
         run: |
           cd kernel-source
-          # 1. Integrate KernelSU-Next Source
-          # We download the 'next' branch which is required for modern qgki kernels
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next
+          # 1. Download KSU-Next into a ROOT folder named 'ksu'
+          # We don't put it in drivers/ this time to avoid the linker error
+          git clone https://github.com/KernelSU-Next/KernelSU-Next ksu
+          cd ksu && git checkout next && cd ..
           
-          # 2. FORCE Integration (Top-Injection Method)
-          # We put the instruction at the TOP of the Makefile to ensure it's never skipped
-          echo "Forcing KSU into Build System..."
-          sed -i '1i obj-y += kernelsu/' drivers/Makefile
-          sed -i '1i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
-
-          # 3. Inject Hooks with "Brace Search"
-          # This finds the function name, then searches for the next '{' and replaces it
-          # This is the most compatible way for Samsung/Qualcomm source code
-          echo "Injecting hooks into fs/open.c..."
-          sed -i '/do_faccessat/,/{/ s/{/{ ksu_handle_faccessat(\&dfd, \&filename, \&mode, NULL);/' fs/open.c
+          # 2. Integrate into the MAIN Makefile (The "Force" method)
+          # We tell the very top Makefile to include our new ksu directory
+          sed -i 's/^core-y[[:space:]]*:=/core-y += ksu\/ \ncore-y := /' Makefile
           
-          echo "Injecting hooks into fs/exec.c..."
-          sed -i '/do_execveat_common/,/{/ s/{/{ ksu_handle_execveat(\&fd, \&filename, \&argv, \&envp, \&flags);/' fs/exec.c
+          # 3. Inject Hooks with absolute safety
+          # We use the specific line numbers/patterns common to Samsung 5.4 kernels
+          echo "Injecting headers..."
+          sed -i '1i #include "../ksu/kernel/ksu.h"' fs/open.c
+          sed -i '1i #include "../ksu/kernel/ksu.h"' fs/exec.c
 
-          # 4. Inject Headers
-          sed -i '1i #include "../drivers/kernelsu/ksu.h"' fs/open.c
-          sed -i '1i #include "../drivers/kernelsu/ksu.h"' fs/exec.c
+          echo "Injecting hooks..."
+          # Match function definition and insert hook after the first '{' on the following line
+          sed -i '/long do_faccessat(int dfd, const char __user \*filename, int mode)/{n;s/{/{ ksu_handle_faccessat(\&dfd, \&filename, \&mode, NULL);/}' fs/open.c
+          sed -i '/int do_execveat_common(int fd, struct filename \*filename,/{n;s/{/{ ksu_handle_execveat(\&fd, \&filename, \&argv, \&envp, \&flags);/}' fs/exec.c
 
-          # 5. Apply Configs to Defconfig
+          # 4. Verify Hooks (Build will fail here if sed failed)
+          grep "ksu_handle_faccessat" fs/open.c || exit 1
+          grep "ksu_handle_execveat" fs/exec.c || exit 1
+
+          # 5. Configs
           CONFIG="arch/arm64/configs/vendor/gta9pwifi_eur_open_defconfig"
           sed -i '/CONFIG_KSU/d' $CONFIG
           {
@@ -72,9 +73,7 @@ jobs:
 
       - name: ⚙️ Configure and Compile
         run: |
-          # Use pipefail to catch errors immediately
           set -o pipefail
-          
           TOOLCHAIN_DIR=$GITHUB_WORKSPACE/toolchains
           CLANG_BIN=$TOOLCHAIN_DIR/clang/bin
           cd $GITHUB_WORKSPACE/kernel-source
@@ -97,21 +96,19 @@ jobs:
             KCFLAGS=-Wno-error
           "
           
-          # 1. Config
           make $MAKE_ARGS vendor/gta9pwifi_eur_open_defconfig
-
-          # 2. Build
-          echo "🚀 Starting compilation (Look for 'CC drivers/kernelsu/...' in logs)..."
+          
+          echo "🚀 Building Kernel (Look for 'ksu/' compilation in logs)..."
           make -j$(nproc --all) $MAKE_ARGS Image.gz dtbs 2>&1 | tee ../build.log
 
-          # 3. Create Image.gz-dtb
+          # Join Kernel + DTB
           mkdir -p $GITHUB_WORKSPACE/final_output
           DTBS=$(find out/arch/arm64/boot/dts -name "*.dtb")
           if [ -n "$DTBS" ]; then
             cat out/arch/arm64/boot/Image.gz $DTBS > out/arch/arm64/boot/Image.gz-dtb
-            cp out/arch/arm64/boot/Image.gz-dtb $GITHUB_WORKSPACE/final_output/
           fi
-          cp out/arch/arm64/boot/Image.gz $GITHUB_WORKSPACE/final_output/
+          
+          find out/arch/arm64/boot -maxdepth 1 -name "Image*" -exec cp {} $GITHUB_WORKSPACE/final_output/ \;
           find out/arch/arm64/boot/dts -name "*.dtb" -exec cp {} $GITHUB_WORKSPACE/final_output/ \;
 
       - name: 📤 Upload
