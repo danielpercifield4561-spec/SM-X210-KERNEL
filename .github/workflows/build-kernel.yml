@@ -66,30 +66,37 @@ jobs:
              exit 1
           fi
    
-      - name: 🛠️ Patch KernelSU-Next
+      - name: 🛠️ Patch KernelSU-Next (Advanced Manual Hooking)
         run: |
           cd kernel-source
           sudo chmod -R 777 .
           
-          # 1. Run the base patch (WITHOUT the legacy flag this time, let it auto-detect)
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next
+          # 1. Run the base patch with legacy flag
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
           
-          # 2. Force the correct Configs in your specific defconfig
+          # 2. INJECT HOOKS: We use a more robust search pattern for Samsung 5.4
+          # Patching fs/open.c (faccessat)
+          sed -i '/long do_faccessat/,/{/ s/{/{ ksu_handle_faccessat(\&dfd, \&filename, \&mode, NULL);/' fs/open.c
+          
+          # Patching fs/exec.c (execve)
+          sed -i '/int do_execveat_common/,/{/ s/{/{ ksu_handle_execveat(\&fd, \&filename, \&argv, \&envp, \&flags);/' fs/exec.c
+          
+          # Patching fs/read_write.c (vfs_read)
+          sed -i '/ssize_t vfs_read/,/{/ s/{/{ ksu_handle_vfs_read(\&file, \&buf, \&count, \&pos);/' fs/read_write.c
+          
+          # Patching fs/stat.c (vfs_statx)
+          sed -i '/int vfs_statx/,/{/ s/{/{ ksu_handle_vfs_statx(\&dfd, \&filename, \&flags, \&stat, \&lookup_flags);/' fs/stat.c
+
+          # 3. Force Configs
           CONFIG="arch/arm64/configs/vendor/gta9pwifi_eur_open_defconfig"
-          
-          # Remove any existing KSU lines to prevent duplicates
           sed -i '/CONFIG_KSU/d' $CONFIG
-          sed -i '/CONFIG_KPROBES/d' $CONFIG
-          sed -i '/CONFIG_OVERLAY_FS/d' $CONFIG
-          
-          # Add the working setup
           echo "CONFIG_KSU=y" >> $CONFIG
           echo "CONFIG_KSU_NEXT=y" >> $CONFIG
+          echo "CONFIG_KSU_MANUAL_HOOK=y" >> $CONFIG
+          # Disable Kprobes as they cause the "No hooks" crash when Manual is active
+          echo "CONFIG_KPROBES=n" >> $CONFIG
           echo "CONFIG_OVERLAY_FS=y" >> $CONFIG
-          echo "CONFIG_KPROBES=y" >> $CONFIG
-          echo "CONFIG_HAVE_KPROBES=y" >> $CONFIG
-          echo "CONFIG_KPROBE_EVENTS=y" >> $CONFIG
-          # We are NOT adding MANUAL_HOOK here so it uses Kprobes instead
+
 
 
       - name: ⚙️ Configure and Compile
