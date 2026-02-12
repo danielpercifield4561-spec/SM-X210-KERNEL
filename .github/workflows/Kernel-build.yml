@@ -1,4 +1,4 @@
-name: Tab A9+ Custom Kernel (Bit 6 - Clean Slate)
+name: Tab A9+ KSU-Next (Compatibility Fix)
 
 on:
   workflow_dispatch:
@@ -9,12 +9,6 @@ jobs:
     steps:
       - name: 📥 Checkout Repository
         uses: actions/checkout@v4
-
-      - name: 🧹 Maximize Build Space
-        run: |
-          sudo docker image prune -a -f
-          sudo rm -rf /usr/share/dotnet /opt/ghc "/usr/local/share/boost"
-          df -h
 
       - name: 🛠️ Install Build Tools
         run: |
@@ -27,57 +21,41 @@ jobs:
 
       - name: 📦 Reconstruct and Unpack Source
         run: |
-          echo "🔗 Recombining split parts..."
           cat Kernel_Source/Kernel.tar.zip.0* > Combined_Kernel.zip
           cat Kernel_Source/Platform.tar.zip.0* > Combined_Platform.zip
-          
           mkdir -p kernel-source
-          echo "📂 Extracting Kernel..."
           7z x Combined_Kernel.zip -okernel-source/
-          echo "📂 Extracting Platform..."
           7z x Combined_Platform.zip -aoa -okernel-source/
-          
           cd kernel-source
-          # More stable extraction of the inner tarball
-          if [ -f "Kernel.tar.gz" ]; then
-            tar -xf Kernel.tar.gz --strip-components=1
-            rm Kernel.tar.gz
-          fi
-          
-          # Simplified Flattening: Look for Makefile and move if not in root
+          find . -name "Kernel.tar.gz" -exec tar -xf {} --strip-components=1 \;
           if [ ! -f "Makefile" ]; then
             MAKE_PATH=$(find . -maxdepth 3 -name "Makefile" | head -n 1)
-            if [ -n "$MAKE_PATH" ]; then
-              SOURCE_DIR=$(dirname "$MAKE_PATH")
-              echo "📂 Moving files from $SOURCE_DIR to root..."
-              mv "$SOURCE_DIR"/* .
-            fi
+            [ -n "$MAKE_PATH" ] && mv $(dirname "$MAKE_PATH")/* .
           fi
-          echo "✅ Source tree ready."
 
-      - name: 🛠️ Patch KernelSU-Next
+      - name: 🛠️ Patch KernelSU-Next & Fix 5.4 Errors
         run: |
           cd kernel-source
-          
-          # 1. Download KernelSU-Next (Using the official setup script which is safer)
+          # 1. Download KSU-Next
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next
           
-          # 2. Integrate into Makefile (Force it to the top)
+          # 2. Backport Fixes for Kernel 5.4
+          # Fix TWA_RESUME and put_task_struct by adding missing headers and definitions
+          echo "Injecting backport shims into kernelsu..."
+          sed -i '1i #include <linux/sched.h>\n#include <linux/sched/task.h>\n#ifndef TWA_RESUME\n#define TWA_RESUME 1\n#endif' drivers/kernelsu/allowlist.c
+          
+          # 3. Force Build System Integration
           sed -i '1i obj-y += kernelsu/' drivers/Makefile
           
-          # 3. Inject Headers and Hooks
-          # Place #include at the very top
+          # 4. Inject Headers and Hooks into System Calls
           sed -i '1i #include "../drivers/kernelsu/ksu.h"' fs/open.c
           sed -i '1i #include "../drivers/kernelsu/ksu.h"' fs/exec.c
-
-          # Inject hooks
           sed -i '/long do_faccessat(int dfd, const char __user \*filename, int mode)/{n;s/{/{ ksu_handle_faccessat(\&dfd, \&filename, \&mode, NULL);/}' fs/open.c
           sed -i '/int do_execveat_common(int fd, struct filename \*filename,/{n;s/{/{ ksu_handle_execveat(\&fd, \&filename, \&argv, \&envp, \&flags);/}' fs/exec.c
 
-          # 4. Handle pre-edited Defconfig
+          # 5. Apply your custom Defconfig
           if [ -f "../gta9pwifi_eur_open_defconfig" ]; then
             cp ../gta9pwifi_eur_open_defconfig arch/arm64/configs/vendor/gta9pwifi_eur_open_defconfig
-            echo "✅ Custom defconfig applied."
           fi
 
       - name: ⚙️ Configure and Compile
@@ -88,37 +66,26 @@ jobs:
           cd $GITHUB_WORKSPACE/kernel-source
           
           MAKE_ARGS="
-            ARCH=arm64 \
-            SUBARCH=arm64 \
-            O=out \
-            CC=$CLANG_BIN/clang \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
+            ARCH=arm64 SUBARCH=arm64 O=out \
+            CC=$CLANG_BIN/clang CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=$TOOLCHAIN_DIR/gcc64/bin/aarch64-linux-android- \
             CROSS_COMPILE_ARM32=$TOOLCHAIN_DIR/gcc32/bin/arm-linux-androideabi- \
-            LD=$CLANG_BIN/ld.lld \
-            AR=$CLANG_BIN/llvm-ar \
-            NM=$CLANG_BIN/llvm-nm \
-            OBJCOPY=$CLANG_BIN/llvm-objcopy \
-            OBJDUMP=$CLANG_BIN/llvm-objdump \
-            STRIP=$CLANG_BIN/llvm-strip \
-            DTC_EXT=dtc \
-            KCFLAGS=-Wno-error
+            LD=$CLANG_BIN/ld.lld AR=$CLANG_BIN/llvm-ar NM=$CLANG_BIN/llvm-nm \
+            OBJCOPY=$CLANG_BIN/llvm-objcopy OBJDUMP=$CLANG_BIN/llvm-objdump \
+            STRIP=$CLANG_BIN/llvm-strip DTC_EXT=dtc KCFLAGS=-Wno-error
           "
           
           make $MAKE_ARGS vendor/gta9pwifi_eur_open_defconfig
           make -j$(nproc --all) $MAKE_ARGS Image.gz dtbs 2>&1 | tee ../build.log
 
-          # Create Image.gz-dtb
+          # Prepare Output
           mkdir -p $GITHUB_WORKSPACE/final_output
           DTBS=$(find out/arch/arm64/boot/dts -name "*.dtb")
-          if [ -n "$DTBS" ]; then
-            cat out/arch/arm64/boot/Image.gz $DTBS > out/arch/arm64/boot/Image.gz-dtb
-          fi
-          
-          find out/arch/arm64/boot -maxdepth 1 -name "Image*" -exec cp {} $GITHUB_WORKSPACE/final_output/ \;
+          [ -n "$DTBS" ] && cat out/arch/arm64/boot/Image.gz $DTBS > out/arch/arm64/boot/Image.gz-dtb
+          cp out/arch/arm64/boot/Image.gz* $GITHUB_WORKSPACE/final_output/
           find out/arch/arm64/boot/dts -name "*.dtb" -exec cp {} $GITHUB_WORKSPACE/final_output/ \;
 
-      - name: 📤 Upload
+      - name: 📤 Upload Result
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -126,28 +93,22 @@ jobs:
           path: |
             final_output/*
             build.log
+
       - name: 🤖 Gemini AI Error Analysis
         if: failure()
         env:
-          Gemini_Key: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.Gemini_Key }}
         run: |
-          # 1. Grab the last 200 lines of the build log (where the error is)
-          ERROR_LOG=$(tail -n 200 build.log | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')
+          # Clean and format error log for JSON
+          ERROR_LOG=$(tail -n 150 build.log | jq -Rs .)
           
-          # 2. Construct the prompt
-          PROMPT="The following is a snippet from an Android kernel build log (Samsung Tab A9+). The build failed. Please explain the exact error in simple terms and provide the corrected code or command to fix it. \n\nLog snippet:\n$ERROR_LOG"
+          PROMPT="The following is a snippet from an Android Kernel 5.4 build (Tab A9+). The build failed. Analyze the error and give me the exact command or code to fix it. Log:\n$ERROR_LOG"
           
-          # 3. Call Gemini API (using Gemini 1.5 Flash - fast and free)
-          RESPONSE=$(curl -X POST "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=$GEMINI_API_KEY" \
+          # Send request to Gemini
+          RESPONSE=$(curl -s -X POST "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=$GEMINI_API_KEY" \
             -H "Content-Type: application/json" \
-            -d "{
-              \"contents\": [{
-                \"parts\": [{
-                  \"text\": \"$PROMPT\"
-                }]
-              }]
-            }")
+            -d "{ \"contents\": [{ \"parts\": [{ \"text\": \"$PROMPT\" }] }] }")
 
-          # 4. Extract the text response and save to Step Summary
+          # Post results to Summary
           echo "### 🤖 Gemini Build Analysis" >> $GITHUB_STEP_SUMMARY
-          echo "$RESPONSE" | jq -r '.candidates[0].content.parts[0].text' >> $GITHUB_STEP_SUMMARY || echo "AI analysis failed to load." >> $GITHUB_STEP_SUMMARY
+          echo "$RESPONSE" | jq -r '.candidates[0].content.parts[0].text' >> $GITHUB_STEP_SUMMARY || echo "AI analysis could not be generated." >> $GITHUB_STEP_SUMMARY
