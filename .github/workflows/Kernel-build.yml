@@ -39,20 +39,25 @@ jobs:
           # 1. Download KSU-Next
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next
           
-          # 2. Backport Fixes for Kernel 5.4 (The allowlist errors)
-          echo "Applying 5.4 compatibility shims..."
+          # 2. Backport Fixes for Kernel 5.4 (allowlist.c)
+          echo "Applying 5.4 compatibility shims to allowlist.c..."
           sed -i '1i #include <linux/sched.h>\n#include <linux/sched/task.h>\n#ifndef TWA_RESUME\n#define TWA_RESUME 1\n#endif' drivers/kernelsu/allowlist.c
           
-          # 3. Force Build System Integration
+          # 3. Fix seccomp compatibility (app_profile.c)
+          # Kernel 5.4 does not have filter_count. We comment this out to allow compilation.
+          echo "Fixing seccomp filter_count for Kernel 5.4..."
+          sed -i 's/atomic_set(&current->seccomp.filter_count, 0);/\/\/ atomic_set(\&current->seccomp.filter_count, 0);/g' drivers/kernelsu/app_profile.c
+
+          # 4. Force Build System Integration
           sed -i '1i obj-y += kernelsu/' drivers/Makefile
           
-          # 4. Inject Hooks and Headers
+          # 5. Inject Hooks and Headers
           sed -i '1i #include "../drivers/kernelsu/ksu.h"' fs/open.c
           sed -i '1i #include "../drivers/kernelsu/ksu.h"' fs/exec.c
           sed -i '/long do_faccessat(int dfd, const char __user \*filename, int mode)/{n;s/{/{ ksu_handle_faccessat(\&dfd, \&filename, \&mode, NULL);/}' fs/open.c
           sed -i '/int do_execveat_common(int fd, struct filename \*filename,/{n;s/{/{ ksu_handle_execveat(\&fd, \&filename, \&argv, \&envp, \&flags);/}' fs/exec.c
 
-          # 5. Apply custom Defconfig if present
+          # 6. Apply custom Defconfig if present
           if [ -f "../gta9pwifi_eur_open_defconfig" ]; then
             cp ../gta9pwifi_eur_open_defconfig arch/arm64/configs/vendor/gta9pwifi_eur_open_defconfig
           fi
