@@ -1,4 +1,4 @@
-name: Tab A9+ Custom Kernel (Bit 6 - qgki)
+name: Tab A9+ Custom Kernel V2 (Bit 6 - qgki)
 
 on:
   workflow_dispatch:
@@ -36,29 +36,25 @@ jobs:
       - name: 🛠️ Patch KernelSU-Next
         run: |
           cd kernel-source
-          # 1. Integrate KernelSU-Next Source
+          # 1. Integrate Source
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next
           
-          # 2. Inject Hooks and Externs
-          # We use 'extern' instead of #include to bypass header path issues
-          # We place the hook AFTER the variable declarations to fix the C90 error
-          
-          echo "Patching fs/open.c..."
-          sed -i '/long do_faccessat(int dfd, const char __user \*filename, int mode)/i \extern int ksu_handle_faccessat(int *dfd, const char __user **filename, int *mode, int *flags);' fs/open.c
-          sed -i '/unsigned int lookup_flags = LOOKUP_FOLLOW;/a \\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);' fs/open.c
-          
-          echo "Patching fs/exec.c..."
-          sed -i '/int do_execveat_common(int fd, struct filename \*filename,/i \struct user_arg_ptr; \nextern int ksu_handle_execveat(int *fd, struct filename **filename, struct user_arg_ptr *argv, struct user_arg_ptr *envp, int *flags);' fs/exec.c
-          sed -i '/struct linux_binprm \*bprm;/a \\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);' fs/exec.c
+          # 2. Add Externs to Top of Files
+          sed -i '1i extern int ksu_handle_faccessat(int *dfd, const char __user **filename, int *mode, int *flags);' fs/open.c
+          sed -i '1i struct user_arg_ptr; \nextern int ksu_handle_execveat(int *fd, struct filename **filename, struct user_arg_ptr *argv, struct user_arg_ptr *envp, int *flags);' fs/exec.c
 
-          # 3. Add Configs
+          # 3. Inject Hooks directly after the function opening brace '{'
+          # This is the most compatible way for 5.4.249
+          sed -i '/long do_faccessat(int dfd, const char __user \*filename, int mode)/{n;s/{/{ ksu_handle_faccessat(\&dfd, \&filename, \&mode, NULL);/}' fs/open.c
+          sed -i '/int do_execveat_common(int fd, struct filename \*filename,/{n;s/{/{ ksu_handle_execveat(\&fd, \&filename, \&argv, \&envp, \&flags);/}' fs/exec.c
+
+          # 4. Configs
           CONFIG="arch/arm64/configs/vendor/gta9pwifi_eur_open_defconfig"
           sed -i '/CONFIG_KSU/d' $CONFIG
           echo "CONFIG_KSU=y" >> $CONFIG
           echo "CONFIG_KSU_NEXT=y" >> $CONFIG
           echo "CONFIG_KSU_MANUAL_HOOK=y" >> $CONFIG
           echo "CONFIG_OVERLAY_FS=y" >> $CONFIG
-          # Disable KPROBES for qgki compatibility with manual hooks
           sed -i 's/CONFIG_KPROBES=y/CONFIG_KPROBES=n/g' $CONFIG
 
       - name: ⚙️ Configure and Compile
@@ -89,31 +85,22 @@ jobs:
           make $MAKE_ARGS vendor/gta9pwifi_eur_open_defconfig
           make -j$(nproc --all) $MAKE_ARGS Image.gz dtbs 2>&1 | tee ../build.log
 
-          # 🔗 Create Image.gz-dtb
+          # 🔗 Artifact Logic
+          mkdir -p $GITHUB_WORKSPACE/final_output
           DTBS=$(find out/arch/arm64/boot/dts -name "*.dtb")
           if [ -n "$DTBS" ]; then
             cat out/arch/arm64/boot/Image.gz $DTBS > out/arch/arm64/boot/Image.gz-dtb
+            cp out/arch/arm64/boot/Image.gz-dtb $GITHUB_WORKSPACE/final_output/
           fi
-
-          # 📦 Prepare Output
-          mkdir -p $GITHUB_WORKSPACE/final_output
-          cp out/arch/arm64/boot/Image.gz-dtb $GITHUB_WORKSPACE/final_output/ 2>/dev/null || cp out/arch/arm64/boot/Image.gz $GITHUB_WORKSPACE/final_output/
+          cp out/arch/arm64/boot/Image.gz $GITHUB_WORKSPACE/final_output/
           find out/arch/arm64/boot/dts -name "*.dtb" -exec cp {} $GITHUB_WORKSPACE/final_output/ \;
 
       - name: 📤 Upload
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Tab-A9-Plus-Kernel-Result
-          path: |
-            final_output/*
-            build.log
-
-      - name: 📤 Upload
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: Tab-A9-Plus-Kernel-Result
+          # Use run_id to avoid the 409 Conflict error
+          name: Kernel-Result-${{ github.run_id }}
           path: |
             final_output/*
             build.log
