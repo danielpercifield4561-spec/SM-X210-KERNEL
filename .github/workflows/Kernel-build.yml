@@ -1,4 +1,4 @@
-name: Tab A9+ KSU-Next (Final Structure Fix)
+name: Tab A9+ Custom Kernel (Bit 6 - Clean Slate)
 
 on:
   workflow_dispatch:
@@ -9,6 +9,12 @@ jobs:
     steps:
       - name: 📥 Checkout Repository
         uses: actions/checkout@v4
+
+      - name: 🧹 Maximize Build Space
+        run: |
+          sudo docker image prune -a -f
+          sudo rm -rf /usr/share/dotnet /opt/ghc "/usr/local/share/boost"
+          df -h
 
       - name: 🛠️ Install Build Tools
         run: |
@@ -21,63 +27,53 @@ jobs:
 
       - name: 📦 Reconstruct and Unpack Source
         run: |
-          echo "🔗 Recombining parts..."
-          cat Kernel_Source/Kernels.zip.* > Combined_Source.zip
+          echo "🔗 Recombining split parts from Kernel_Source folder..."
+          # Joining Kernel parts 001-008
+          cat Kernel_Source/Kernel.tar.zip.00* > Combined_Kernel.zip
+          # Joining Platform parts 001-002
+          cat Kernel_Source/Platform.tar.zip.00* > Combined_Platform.zip
           
           mkdir -p kernel-source
-          7z x Combined_Source.zip -okernel-source/
+          echo "📂 Extracting Kernel..."
+          7z x Combined_Kernel.zip -okernel-source/
+          echo "📂 Extracting Platform..."
+          7z x Combined_Platform.zip -aoa -okernel-source/
           
-          # Force deep extraction
           cd kernel-source
-          find . -name "*.zip" -exec 7z x {} -aoa \;
-          find . -name "*.tar.gz" -exec tar -xf {} --strip-components=1 \;
+          # Extract Samsung's inner tarball if it's there
+          find . -maxdepth 2 -name "Kernel.tar.gz" -exec tar -xf {} --strip-components=1 \;
           
-          # FLATTEN: Find the directory that contains the Makefile and move everything to the root
-          REAL_ROOT=$(find . -name "Makefile" -exec dirname {} \; | head -n 1)
-          if [ "$REAL_ROOT" != "." ]; then
-            echo "📂 Moving source from $REAL_ROOT to root..."
+          # FLATTEN: Ensure Makefile is in the root of 'kernel-source'
+          REAL_ROOT=$(find . -maxdepth 3 -name "Makefile" -exec dirname {} \; | head -n 1)
+          if [ "$REAL_ROOT" != "." ] && [ -n "$REAL_ROOT" ]; then
+            echo "📂 Flattening: Moving files from $REAL_ROOT to root..."
             mv "$REAL_ROOT"/* .
           fi
-          
-          echo "🔍 Directory contents after flattening:"
-          ls -F
+          echo "✅ Source tree ready. Checking for defconfig..."
+          ls -F arch/arm64/configs/vendor/gta9pwifi_eur_open_defconfig
 
-      - name: 🛠️ Patch KernelSU-Next
+      - name: 🛠️ Patch KernelSU-Next (Top-Level Integration)
         run: |
           cd kernel-source
-          
-          # 1. Clone the 'next' branch directly
-          echo "📥 Cloning KernelSU-Next..."
+          # 1. Clone KSU-Next 'next' branch
           git clone https://github.com/KernelSU-Next/KernelSU-Next.git -b next ksu
           
-          # 2. Integrate into the MAIN Makefile
-          # This forces the ksu directory to be compiled
-          echo "⚙️ Integrating KSU into Makefile..."
-          sed -i 's/^core-y[[:space:]]*:=/core-y += ksu\/ \ncore-y := /' Makefile
+          # 2. Integrate into Makefile
+          sed -i '1i obj-y += ksu/' Makefile
           
           # 3. Inject Headers and Hooks
-          echo "💉 Injecting Hooks..."
-          # Add headers to the very top
           sed -i '1i #include "ksu/kernel/ksu.h"' fs/open.c
           sed -i '1i #include "ksu/kernel/ksu.h"' fs/exec.c
-
-          # Match function and insert hook after opening brace {
           sed -i '/long do_faccessat(int dfd, const char __user \*filename, int mode)/{n;s/{/{ ksu_handle_faccessat(\&dfd, \&filename, \&mode, NULL);/}' fs/open.c
           sed -i '/int do_execveat_common(int fd, struct filename \*filename,/{n;s/{/{ ksu_handle_execveat(\&fd, \&filename, \&argv, \&envp, \&flags);/}' fs/exec.c
 
-          # 4. Verify Patch
-          grep "ksu_handle" fs/open.c || (echo "❌ Hook injection failed!" && exit 1)
-
-          # 5. Configs
-          CONFIG="arch/arm64/configs/vendor/gta9pwifi_eur_open_defconfig"
-          sed -i '/CONFIG_KSU/d' $CONFIG
-          {
-            echo "CONFIG_KSU=y"
-            echo "CONFIG_KSU_NEXT=y"
-            echo "CONFIG_KSU_MANUAL_HOOK=y"
-            echo "CONFIG_OVERLAY_FS=y"
-            echo "CONFIG_KPROBES=n"
-          } >> $CONFIG
+          # 4. Use PRE-EDITED Defconfig from repo root
+          if [ -f "../gta9pwifi_eur_open_defconfig" ]; then
+            cp ../gta9pwifi_eur_open_defconfig arch/arm64/configs/vendor/gta9pwifi_eur_open_defconfig
+            echo "✅ Successfully used your custom defconfig."
+          else
+             echo "⚠️ Custom defconfig not found in root. Using stock."
+          fi
 
       - name: ⚙️ Configure and Compile
         run: |
@@ -105,11 +101,10 @@ jobs:
           "
           
           make $MAKE_ARGS vendor/gta9pwifi_eur_open_defconfig
-          
           echo "🚀 Building Kernel..."
           make -j$(nproc --all) $MAKE_ARGS Image.gz dtbs 2>&1 | tee ../build.log
 
-          # 🔗 Gather Artifacts
+          # Join Kernel + DTB
           mkdir -p $GITHUB_WORKSPACE/final_output
           DTBS=$(find out/arch/arm64/boot/dts -name "*.dtb")
           if [ -n "$DTBS" ]; then
@@ -119,11 +114,11 @@ jobs:
           find out/arch/arm64/boot -maxdepth 1 -name "Image*" -exec cp {} $GITHUB_WORKSPACE/final_output/ \;
           find out/arch/arm64/boot/dts -name "*.dtb" -exec cp {} $GITHUB_WORKSPACE/final_output/ \;
 
-      - name: 📤 Upload
+      - name: 📤 Upload Result
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Kernel-KSU-Next-${{ github.run_id }}
+          name: Kernel-Result-${{ github.run_id }}
           path: |
             final_output/*
             build.log
