@@ -27,11 +27,9 @@ jobs:
 
       - name: 📦 Reconstruct and Unpack Source
         run: |
-          echo "🔗 Recombining split parts from Kernel_Source folder..."
-          # Joining Kernel parts 001-008
-          cat Kernel_Source/Kernel.tar.zip.00* > Combined_Kernel.zip
-          # Joining Platform parts 001-002
-          cat Kernel_Source/Platform.tar.zip.00* > Combined_Platform.zip
+          echo "🔗 Recombining split parts..."
+          cat Kernel_Source/Kernel.tar.zip.0* > Combined_Kernel.zip
+          cat Kernel_Source/Platform.tar.zip.0* > Combined_Platform.zip
           
           mkdir -p kernel-source
           echo "📂 Extracting Kernel..."
@@ -40,39 +38,46 @@ jobs:
           7z x Combined_Platform.zip -aoa -okernel-source/
           
           cd kernel-source
-          # Extract Samsung's inner tarball if it's there
-          find . -maxdepth 2 -name "Kernel.tar.gz" -exec tar -xf {} --strip-components=1 \;
-          
-          # FLATTEN: Ensure Makefile is in the root of 'kernel-source'
-          REAL_ROOT=$(find . -maxdepth 3 -name "Makefile" -exec dirname {} \; | head -n 1)
-          if [ "$REAL_ROOT" != "." ] && [ -n "$REAL_ROOT" ]; then
-            echo "📂 Flattening: Moving files from $REAL_ROOT to root..."
-            mv "$REAL_ROOT"/* .
+          # More stable extraction of the inner tarball
+          if [ -f "Kernel.tar.gz" ]; then
+            tar -xf Kernel.tar.gz --strip-components=1
+            rm Kernel.tar.gz
           fi
-          echo "✅ Source tree ready. Checking for defconfig..."
-          ls -F arch/arm64/configs/vendor/gta9pwifi_eur_open_defconfig
+          
+          # Simplified Flattening: Look for Makefile and move if not in root
+          if [ ! -f "Makefile" ]; then
+            MAKE_PATH=$(find . -maxdepth 3 -name "Makefile" | head -n 1)
+            if [ -n "$MAKE_PATH" ]; then
+              SOURCE_DIR=$(dirname "$MAKE_PATH")
+              echo "📂 Moving files from $SOURCE_DIR to root..."
+              mv "$SOURCE_DIR"/* .
+            fi
+          fi
+          echo "✅ Source tree ready."
 
-      - name: 🛠️ Patch KernelSU-Next (Top-Level Integration)
+      - name: 🛠️ Patch KernelSU-Next
         run: |
           cd kernel-source
-          # 1. Clone KSU-Next 'next' branch
-          git clone https://github.com/KernelSU-Next/KernelSU-Next.git -b next ksu
           
-          # 2. Integrate into Makefile
-          sed -i '1i obj-y += ksu/' Makefile
+          # 1. Download KernelSU-Next (Using the official setup script which is safer)
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next
+          
+          # 2. Integrate into Makefile (Force it to the top)
+          sed -i '1i obj-y += kernelsu/' drivers/Makefile
           
           # 3. Inject Headers and Hooks
-          sed -i '1i #include "ksu/kernel/ksu.h"' fs/open.c
-          sed -i '1i #include "ksu/kernel/ksu.h"' fs/exec.c
+          # Place #include at the very top
+          sed -i '1i #include "../drivers/kernelsu/ksu.h"' fs/open.c
+          sed -i '1i #include "../drivers/kernelsu/ksu.h"' fs/exec.c
+
+          # Inject hooks
           sed -i '/long do_faccessat(int dfd, const char __user \*filename, int mode)/{n;s/{/{ ksu_handle_faccessat(\&dfd, \&filename, \&mode, NULL);/}' fs/open.c
           sed -i '/int do_execveat_common(int fd, struct filename \*filename,/{n;s/{/{ ksu_handle_execveat(\&fd, \&filename, \&argv, \&envp, \&flags);/}' fs/exec.c
 
-          # 4. Use PRE-EDITED Defconfig from repo root
+          # 4. Handle pre-edited Defconfig
           if [ -f "../gta9pwifi_eur_open_defconfig" ]; then
             cp ../gta9pwifi_eur_open_defconfig arch/arm64/configs/vendor/gta9pwifi_eur_open_defconfig
-            echo "✅ Successfully used your custom defconfig."
-          else
-             echo "⚠️ Custom defconfig not found in root. Using stock."
+            echo "✅ Custom defconfig applied."
           fi
 
       - name: ⚙️ Configure and Compile
@@ -101,10 +106,9 @@ jobs:
           "
           
           make $MAKE_ARGS vendor/gta9pwifi_eur_open_defconfig
-          echo "🚀 Building Kernel..."
           make -j$(nproc --all) $MAKE_ARGS Image.gz dtbs 2>&1 | tee ../build.log
 
-          # Join Kernel + DTB
+          # Create Image.gz-dtb
           mkdir -p $GITHUB_WORKSPACE/final_output
           DTBS=$(find out/arch/arm64/boot/dts -name "*.dtb")
           if [ -n "$DTBS" ]; then
@@ -114,7 +118,7 @@ jobs:
           find out/arch/arm64/boot -maxdepth 1 -name "Image*" -exec cp {} $GITHUB_WORKSPACE/final_output/ \;
           find out/arch/arm64/boot/dts -name "*.dtb" -exec cp {} $GITHUB_WORKSPACE/final_output/ \;
 
-      - name: 📤 Upload Result
+      - name: 📤 Upload
         if: always()
         uses: actions/upload-artifact@v4
         with:
